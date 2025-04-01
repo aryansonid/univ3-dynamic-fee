@@ -38,6 +38,8 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     using Position for Position.Info;
     using Oracle for Oracle.Observation[65535];
 
+    uint256 constant public FEE_PRICISION = 1e4;
+
     /// @inheritdoc IUniswapV3PoolImmutables
     address public immutable override factory;
     /// @inheritdoc IUniswapV3PoolImmutables
@@ -72,6 +74,9 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     }
     /// @inheritdoc IUniswapV3PoolState
     Slot0 public override slot0;
+
+    // Toggle for dynamic fees
+    bool public useDynamicFee;
 
     /// @inheritdoc IUniswapV3PoolState
     uint256 public override feeGrowthGlobal0X128;
@@ -233,8 +238,8 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     }
 
     /// @inheritdoc IUniswapV3PoolDerivedState
-    function observe(uint32[] calldata secondsAgos)
-        external
+    function observe(uint32[] memory secondsAgos) 
+        public
         view
         override
         noDelegateCall
@@ -667,7 +672,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                     : step.sqrtPriceNextX96,
                 state.liquidity,
                 state.amountSpecifiedRemaining,
-                fee
+                getFee(state.tick) 
             );
 
             if (exactInput) {
@@ -865,5 +870,58 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         }
 
         emit CollectProtocol(msg.sender, recipient, amount0, amount1);
+    }
+
+    /// @notice Toggles between using dynamic fees and fixed fees
+    function toggleDynamicFees() external onlyFactoryOwner { 
+        useDynamicFee = !useDynamicFee;
+
+        emit ToggledDynamicFees(msg.sender, useDynamicFee);
+    }
+
+    /// @notice Returns the current fee based on whether dynamic fees are enabled
+    /// @param currentTick The current tick of the pool
+    /// @return The fee in hundredths of a basis point (e.g., 500 = 0.05%)
+    function getFee(int24 currentTick) public view returns (uint24) {
+        if (useDynamicFee) {
+            return getDynamicFee(currentTick);
+        } else {
+            return fee; // Default fixed fee (0.3%)
+        }
+    }
+
+    /// @notice Computes a dynamic fee based on recent price volatility
+    /// @param currentTick The current tick of the pool
+    /// @return The dynamically adjusted fee in hundredths of a basis point
+    function getDynamicFee(int24 currentTick) internal view returns (uint24) {
+        int24 twapTick;
+        {
+            uint32[] memory secondsAgos = new uint32[](2);
+            secondsAgos[0] = 600; // 10 minutes ago
+            secondsAgos[1] = 0;    // Now
+
+            (int56[] memory tickCumulatives, ) = observe(secondsAgos);
+            twapTick = int24((tickCumulatives[1] - tickCumulatives[0]) / 600);
+        }
+
+        uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(currentTick);
+        uint160 twapSqrtPriceX96 = TickMath.getSqrtRatioAtTick(twapTick);
+
+        uint256 price = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96)) / FixedPoint96.Q96;
+        uint256 twapPrice = (uint256(twapSqrtPriceX96) * uint256(twapSqrtPriceX96)) / FixedPoint96.Q96;
+
+        // Calculate percentage difference
+        uint256 priceDiff = price > twapPrice 
+            ? ((price - twapPrice) * FEE_PRICISION) / twapPrice 
+            : ((twapPrice - price) * FEE_PRICISION) / price;
+
+        // Determine fee based on volatility
+        if (priceDiff < 500) {
+            return uint24(500);  // 0.05%
+        } else if (priceDiff < 1500) {
+            return uint24(3000); // 0.3%
+        } else {
+            return uint24(10000); // 1%
+        }
     }
 }
